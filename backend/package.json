@@ -4,6 +4,9 @@
   "private": true,
   "description": "Modular image-to-video backend for the Reel prototype. Swap providers in /providers without touching server.js or the frontend.",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"

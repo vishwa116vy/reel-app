@@ -1,8 +1,9 @@
 import express from "express";
 import cors from "cors";
 import multer from "multer";
+import { Readable } from "node:stream";
 import { config } from "./config.js";
-import { huggingfaceProvider } from "./huggingfaceProvider.js";
+import { huggingfaceProvider } from "./providers/huggingfaceProvider.js";
 
 /**
  * Provider registry. To add a commercial provider later:
@@ -60,12 +61,107 @@ app.post("/api/generate", upload.single("image"), async (req, res) => {
 app.get("/api/status/:jobId", async (req, res) => {
   try {
     const result = await provider.checkStatus(req.params.jobId);
+
+    // IMPORTANT: never send the raw Hugging Face file URL to the
+    // browser. HF's file host rejects requests that don't come from
+    // huggingface.co ("Forbidden embedding"), so the frontend can't
+    // load it directly. Instead we hand back a path on OUR OWN
+    // backend, which fetches the real file server-side and streams it
+    // through — see /api/video/:jobId below.
+    if (result.status === "complete") {
+      return res.json({
+        status: "complete",
+        progress: 100,
+        videoUrl: `/api/video/${req.params.jobId}`,
+      });
+    }
+
     res.json(result);
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Could not check job status." });
   }
 });
+
+// Streams the generated video from Hugging Face through our own
+// backend, so the browser only ever talks to our domain — this is
+// what fixes the "Forbidden embedding" error. Supports HTTP range
+// requests so scrubbing/seeking works in mobile video players too.
+app.get("/api/video/:jobId", async (req, res) => {
+  try {
+    const job = await provider.checkStatus(req.params.jobId);
+
+    if (job.status !== "complete" || !job.videoUrl) {
+      return res.status(404).json({
+        message: "This video isn't available anymore. Please generate a new one.",
+      });
+    }
+
+    if (req.query.download) {
+      res.setHeader("Content-Disposition", 'attachment; filename="reel-video.mp4"');
+    }
+
+    await proxyVideo(job.videoUrl, req, res);
+  } catch (err) {
+    console.error("Video proxy error:", err);
+    if (!res.headersSent) {
+      res.status(502).json({
+        message: "Could not retrieve the generated video. Please try generating a new one.",
+      });
+    } else {
+      res.end();
+    }
+  }
+});
+
+/**
+ * Fetches a video from an upstream URL (server-side, so HF's
+ * hotlink/embedding restriction never applies) and pipes it straight
+ * through to the browser with the right headers for playback and
+ * range requests.
+ */
+async function proxyVideo(sourceUrl, req, res) {
+  const upstreamHeaders = {
+    // Some HF-hosted file URLs only serve requests that look like they
+    // came from huggingface.co — this is exactly the check that
+    // rejects direct-from-Netlify requests. A server-to-server fetch
+    // with this Referer set satisfies it.
+    Referer: "https://huggingface.co/",
+  };
+  if (config.huggingface.apiToken) {
+    upstreamHeaders.Authorization = `Bearer ${config.huggingface.apiToken}`;
+  }
+  if (req.headers.range) {
+    upstreamHeaders.Range = req.headers.range;
+  }
+
+  const upstream = await fetch(sourceUrl, { headers: upstreamHeaders });
+
+  if (!upstream.ok && upstream.status !== 206) {
+    throw new Error(`Upstream video host returned status ${upstream.status}`);
+  }
+  if (!upstream.body) {
+    throw new Error("Upstream video host returned an empty response.");
+  }
+
+  res.status(upstream.status === 206 ? 206 : 200);
+  res.setHeader("Content-Type", upstream.headers.get("content-type") || "video/mp4");
+  res.setHeader("Accept-Ranges", "bytes");
+
+  const contentLength = upstream.headers.get("content-length");
+  if (contentLength) res.setHeader("Content-Length", contentLength);
+
+  const contentRange = upstream.headers.get("content-range");
+  if (contentRange) res.setHeader("Content-Range", contentRange);
+
+  await new Promise((resolve, reject) => {
+    const nodeStream = Readable.fromWeb(upstream.body);
+    nodeStream.pipe(res);
+    nodeStream.on("end", resolve);
+    nodeStream.on("error", reject);
+    res.on("close", resolve);
+  });
+}
 
 app.get("/api/health", (_req, res) => res.json({ ok: true, provider: config.provider }));
 
