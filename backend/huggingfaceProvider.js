@@ -1,6 +1,6 @@
 import { Client } from "@gradio/client";
 import sharp from "sharp";
-import { config } from "../config.js";
+import { config } from "./config.js";
 
 /**
  * Free-tier provider — calls the public Hugging Face Space
