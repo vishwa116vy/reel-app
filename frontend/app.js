@@ -19,7 +19,7 @@ const CONFIG = {
   // Your backend's address. localhost:3001 while you're running it on
   // your own computer for testing; swap this to your deployed backend
   // URL once you host it (see README).
-  API_BASE_URL: window.REEL_API_BASE_URL || "https://reel-app-vbiw.onrender.com",
+  API_BASE_URL: window.REEL_API_BASE_URL || "http://localhost:3001",
 
   // Now connected to the real backend by default. Set this back to
   // true any time you want to click through the UI with no backend
@@ -323,11 +323,22 @@ function renderProgress({ status, progress = 0 }) {
       : "This usually takes 1–3 minutes on the free tier.";
 }
 
-function showResult(videoUrl) {
-  els.resultVideo.src = videoUrl;
-  els.downloadBtn.href = videoUrl;
+function showResult(videoPath) {
+  const playUrl = resolveVideoUrl(videoPath);
+  els.resultVideo.src = playUrl;
+  // Our backend adds a forced-download header when ?download=1 is present,
+  // so this works even though the video is served cross-origin from Netlify.
+  els.downloadBtn.href = videoPath.startsWith("http") ? playUrl : `${playUrl}?download=1`;
   applyResultFrameShape();
   setScreen("result");
+}
+
+// Status responses now return a path on OUR OWN backend (e.g.
+// "/api/video/<jobId>") rather than a raw Hugging Face URL — this is
+// what avoids the "Forbidden embedding" error. Demo mode still returns
+// a full https:// URL directly, so only prefix relative paths.
+function resolveVideoUrl(pathOrUrl) {
+  return pathOrUrl.startsWith("http") ? pathOrUrl : `${CONFIG.API_BASE_URL}${pathOrUrl}`;
 }
 
 function startElapsedTimer() {
@@ -379,6 +390,16 @@ function clearError() {
   els.errorNote.hidden = true;
   els.errorNote.textContent = "";
 }
+
+/* --- video playback errors (e.g. source no longer available) --- */
+
+els.resultVideo.addEventListener("error", () => {
+  if (!els.resultVideo.src) return; // ignore the empty initial state
+  showError(
+    "Your video couldn't be played. It may no longer be available on the free model's servers — please try generating again."
+  );
+  setScreen("form");
+});
 
 /* --- init --- */
 
