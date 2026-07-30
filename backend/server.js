@@ -3,7 +3,7 @@ import cors from "cors";
 import multer from "multer";
 import { Readable } from "node:stream";
 import { config } from "./config.js";
-import { huggingfaceProvider } from "./providers/huggingfaceProvider.js";
+import { huggingfaceProvider } from "./huggingfaceProvider.js";
 
 /**
  * Provider registry. To add a commercial provider later:
