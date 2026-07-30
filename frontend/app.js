@@ -19,7 +19,7 @@ const CONFIG = {
   // Your backend's address. localhost:3001 while you're running it on
   // your own computer for testing; swap this to your deployed backend
   // URL once you host it (see README).
-  API_BASE_URL: window.REEL_API_BASE_URL || "http://localhost:3001",
+  API_BASE_URL: window.REEL_API_BASE_URL || "https://reel-app-vbiw.onrender.com",
 
   // Now connected to the real backend by default. Set this back to
   // true any time you want to click through the UI with no backend
