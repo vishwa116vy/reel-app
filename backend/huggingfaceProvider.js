@@ -15,17 +15,10 @@ const TARGET_DIMENSIONS = {
 };
 
 // Conservative first test using the Space UI's own defaults.
-const STEPS = 6;
-const DURATION_SECONDS = 3.5;
+const STEPS = 8;
+const DURATION_SECONDS = 5;
 const GUIDANCE_SCALE = 1;
 const GUIDANCE_SCALE_2 = 1;
-const QUALITY = 6;
-const SCHEDULER = "FlowMatchEulerDiscrete";
-const FLOW_SHIFT = 3.0;
-const FRAME_MULTIPLIER = 16;
-const SAFE_MODE = true;
-const LORA_GROUPS = [];
-const DISPLAY_RESULT = true;
 
 const NEGATIVE_PROMPT =
   "色调艳丽, 过曝, 静态, 细节模糊不清, 字幕, 风格, 作品, 画作, 画面, 静止, 整体发灰, 最差质量, 低质量, JPEG压缩残留, 丑陋的, 残缺的, 多余的手指, 画得不好的手部, 画得不好的脸部, 畸形的, 毁容的, 形态畸形的肢体, 手指融合, 静止不动的画面, 杂乱的背景, 三条腿, 背景人很多, 倒着走";
@@ -90,13 +83,10 @@ async function runJob(jobId, { imageBuffer, prompt, aspectRatio }) {
 
   const imageBlob = new Blob([preparedImage], { type: "image/png" });
 
-  // Verified current UI input order:
-  // image, last_image, prompt, steps, negative_prompt, duration,
-  // guidance1, guidance2, seed, randomize, quality, scheduler,
-  // flow_shift, frame_multiplier, safe_mode, lora_groups, display_result
+  // Current official Space API: image, prompt, steps, negative_prompt,
+  // duration_seconds, guidance_scale, guidance_scale_2, seed, randomize_seed.
   const args = [
     imageBlob,
-    null,
     prompt,
     STEPS,
     NEGATIVE_PROMPT,
@@ -105,13 +95,6 @@ async function runJob(jobId, { imageBuffer, prompt, aspectRatio }) {
     GUIDANCE_SCALE_2,
     Math.floor(Math.random() * 2_147_483_647),
     true,
-    QUALITY,
-    SCHEDULER,
-    FLOW_SHIFT,
-    FRAME_MULTIPLIER,
-    SAFE_MODE,
-    LORA_GROUPS,
-    DISPLAY_RESULT,
   ];
 
   setJobSafe(jobId, { status: "processing", progress: 15, startedAt });
@@ -180,9 +163,8 @@ async function runCandidateWithTimeout(client, apiName, args, jobId, startedAt) 
 
       if (event.type === "data") {
         log(jobId, "data received");
-        // Current Space returns: [video output, downloadable file, seed].
-        const videoUrl =
-          extractVideoUrl(event.data?.[1]) || extractVideoUrl(event.data?.[0]);
+        // Official Space returns the generated video as the first output.
+        const videoUrl = extractVideoUrl(event.data?.[0]) || extractVideoUrl(event.data?.[1]);
         if (videoUrl) return { videoUrl };
       }
     }
