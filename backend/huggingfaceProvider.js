@@ -8,44 +8,54 @@ import { config } from "./config.js";
  * with Lightning LoRA distillation, FP8 quantization + AOT compile,
  * running on free ZeroGPU (H200) hardware. No paid API, no card.
  *
- * Verified against the Space's actual source (app.py) on 2026-07-30:
+ * Re-verified against the Space's live app.py on 2026-07-31 (unchanged
+ * since the last check):
  *   - underlying fn: generate_video(input_image, prompt, steps,
  *       negative_prompt, duration_seconds, guidance_scale,
  *       guidance_scale_2, seed, randomize_seed) -> (video_path, seed)
- *   - bound as: generate_button.click(fn=generate_video, inputs=[
- *       input_image, prompt, steps, negative_prompt, duration_seconds,
- *       guidance_scale, guidance_scale_2, seed, randomize_seed])
- *   - REAL text-prompt conditioning (unlike the old SVD provider —
- *     no more motion-keyword guessing; the prompt goes to the model).
- *   - Resolution handling is dynamic: square input -> 640x640; other
- *     aspect ratios are clamped/cropped between 480-832px per side, in
- *     multiples of 16. We pre-crop to the Space's own native target
- *     sizes below so ITS internal cropping is a no-op and nothing gets
- *     stretched or unexpectedly re-framed.
- *   - Fixed 16fps, 8-80 frames (0.5s-5.0s duration).
+ *   - Fixed 16fps, 8-80 frames (0.5s-5.0s duration). Our DURATION_SECONDS=5
+ *     and STEPS=8 are both within the Space's own supported/documented
+ *     ranges (max duration is exactly 5.0; the Space's own description
+ *     says its Lightning LoRA is tuned for a 4-8 step fast range) — this
+ *     was double-checked against the live get_duration() formula, which
+ *     puts our worst case at ~90-95s of GPU compute. That is NOT what
+ *     causes the "stuck at 15%" symptom below; it's well within what
+ *     this Space is built to request. Left unchanged.
+ *   - Status events (verified against @gradio/client's own docs) carry a
+ *     `stage` field ("pending"|"generating"|"complete"|"error"), plus
+ *     `position`, `queue_size`, `eta`, `progress_data`. The submission
+ *     object also exposes `.cancel()`.
  *
- * One thing we could NOT verify by executing code (no outbound network
- * access from where this was written): the exact auto-assigned Gradio
- * api_name, since the Space's app.py doesn't set one explicitly. Gradio
- * defaults to "/<function_name>" ("/generate_video" here), but this
- * function is wired to TWO events (the Generate button, and a cached
- * Examples gallery) — Gradio may suffix the second one. CANDIDATE_API_NAMES
- * below tries "/generate_video" first; if that call ends WITHOUT ever
- * receiving a single event from the Space (meaning the name itself was
- * rejected before any GPU time was spent), it retries once with
- * "/generate_video_1". Once real events start arriving, no more fallback
- * attempts happen — a genuine generation failure is never mistaken for a
- * routing problem or retried at GPU cost. If both candidates ever stop
- * working (the Space's code changed), the error message will say so
- * clearly, and this is the one line to check first.
+ * WHY GENERATION COULD HANG INDEFINITELY (the bug being fixed here):
+ * This Space runs on a single shared public queue (Gradio's default
+ * concurrency is 1 request at a time for a given endpoint). If several
+ * people are ahead of us, or the underlying event stream to Hugging
+ * Face stalls, @gradio/client's `for await` loop simply has nothing to
+ * iterate — it doesn't error, it just never resolves the next step.
+ * The OLD code had no ceiling on that wait at all, so a stalled queue
+ * or dropped connection meant the job sat at whatever progress % it
+ * last reported, forever. The fix: a hard local watchdog timeout (see
+ * GENERATION_TIMEOUT_MS) that always resolves the job one way or the
+ * other, using Promise.race + submission.cancel(), regardless of what
+ * Hugging Face's server does or doesn't send us.
  *
- * Swapping to a commercial provider later: create
- * providers/<name>Provider.js with the same generate()/checkStatus()
- * shape (see provider.interface.js), then set VIDEO_PROVIDER in .env.
- * server.js and the entire frontend stay unchanged.
+ * Gradio api_name: same fallback strategy as before — "/generate_video"
+ * is tried first; "/generate_video_1" is only tried if we receive ZERO
+ * events on the first name (a real routing rejection fails fast, not
+ * after a long wait, so this never gets confused with a slow queue).
+ *
+ * Swapping to a commercial provider later: create a new file with the
+ * same generate()/checkStatus() shape (see provider.interface.js),
+ * then set VIDEO_PROVIDER in .env. server.js and the frontend stay
+ * unchanged.
  */
 
 const CANDIDATE_API_NAMES = ["/generate_video", "/generate_video_1"];
+
+// Hard ceiling on how long we'll wait for ONE generation attempt before
+// giving up and reporting failure. This is a REAL watchdog — it fires
+// even if zero events ever arrive from Hugging Face.
+const GENERATION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 // In-memory job store. Fine for a single prototype server; replace with
 // Redis/a database before running more than one server instance.
@@ -53,7 +63,6 @@ const jobs = new Map();
 
 // How long a generation typically takes on this Space, used only to
 // pace the progress bar when it doesn't report exact percentages.
-// (Updated for the 8-step / 5s settings below — worst case ~95s.)
 const EXPECTED_DURATION_MS = 95_000;
 
 // This Space's own native target resolutions (see resize_image() in
@@ -66,21 +75,9 @@ const TARGET_DIMENSIONS = {
   "1:1": { width: 640, height: 640 },
 };
 
-// Generation settings — verified against this Space's own app.py.
-//
-// STEPS = 8: the Space's own description says the Lightning LoRA is
-// tuned for a "4-8 steps" fast range; 8 is the top of that documented
-// range and visibly sharper than 6, without leaving the range the
-// model was actually distilled for. Going higher (the slider allows
-// up to 30) isn't documented as beneficial for this distilled LoRA,
-// so we don't guess past what the authors describe.
-//
-// DURATION_SECONDS = 5: this Space's own MAX_DURATION is exactly 5.0
-// (80 frames / 16fps) — the model's real maximum, not an estimate.
-//
-// GUIDANCE_SCALE / GUIDANCE_SCALE_2 stay at 1 (the Space's own
-// default): this LoRA is distilled for guidance≈1, and raising it is
-// not a documented or recommended use of this Space, so we leave it.
+// Generation settings — unchanged from the last review. See the header
+// comment above for why 8 steps / 5s is a supported combination and
+// not the cause of the hang this update fixes.
 const STEPS = 8;
 const DURATION_SECONDS = 5;
 const GUIDANCE_SCALE = 1;
@@ -101,15 +98,24 @@ async function getClient() {
   return clientPromise;
 }
 
+// --- structured logging (Render Live Tail friendly) ---
+// Never logs HF_TOKEN, image bytes, or other sensitive data — only
+// job ids, stage names, and short status text.
+function log(jobId, message) {
+  console.log(`[HF] Job ${jobId} — ${message}`);
+}
+
 export const huggingfaceProvider = {
   async generate({ imageBuffer, mimeType, prompt, aspectRatio }) {
     const jobId = `hf-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    log(jobId, "created");
     jobs.set(jobId, { status: "queued", progress: 3, startedAt: Date.now() });
 
     // Runs in the background — the HTTP request returns immediately
     // with the jobId so the frontend can poll for progress.
     runJob(jobId, { imageBuffer, mimeType, prompt, aspectRatio }).catch((err) => {
-      jobs.set(jobId, {
+      log(jobId, `error: ${err.message}`);
+      setJobSafe(jobId, {
         status: "failed",
         message: friendlyErrorMessage(err),
       });
@@ -126,14 +132,23 @@ export const huggingfaceProvider = {
   },
 };
 
+// Writes job state UNLESS the job has already reached a terminal state
+// (complete/failed). This is what prevents a late event from an
+// abandoned/timed-out submission from ever overwriting a job that has
+// already been resolved one way or the other.
+function setJobSafe(jobId, patch) {
+  const current = jobs.get(jobId);
+  if (current && (current.status === "complete" || current.status === "failed")) {
+    return; // already finalized — ignore stale updates
+  }
+  jobs.set(jobId, { ...current, ...patch });
+}
+
 async function runJob(jobId, { imageBuffer, mimeType, prompt, aspectRatio }) {
   const startedAt = jobs.get(jobId).startedAt;
-  jobs.set(jobId, { status: "queued", progress: 8, startedAt });
+  setJobSafe(jobId, { status: "queued", progress: 8, startedAt });
 
-  // 1. Crop the source photo to this Space's own native target size
-  //    for the chosen aspect ratio (see TARGET_DIMENSIONS comment above).
-  //    PNG (lossless) instead of re-compressed JPEG: one less layer of
-  //    compression softness feeding into the model.
+  log(jobId, "preparing image");
   const dims = TARGET_DIMENSIONS[aspectRatio] || TARGET_DIMENSIONS["9:16"];
   const preparedImage = await sharp(imageBuffer)
     .rotate() // respect EXIF orientation from phone cameras
@@ -141,7 +156,9 @@ async function runJob(jobId, { imageBuffer, mimeType, prompt, aspectRatio }) {
     .png({ compressionLevel: 6 })
     .toBuffer();
 
+  log(jobId, "connecting to Space");
   const client = await getClient();
+  log(jobId, "connected");
   const imageBlob = new Blob([preparedImage], { type: "image/png" });
 
   const args = [
@@ -156,55 +173,24 @@ async function runJob(jobId, { imageBuffer, mimeType, prompt, aspectRatio }) {
     true, // randomize_seed
   ];
 
-  jobs.set(jobId, { status: "processing", progress: 15, startedAt });
+  setJobSafe(jobId, { status: "processing", progress: 15, startedAt });
 
   let lastRoutingError;
   for (let i = 0; i < CANDIDATE_API_NAMES.length; i++) {
     const apiName = CANDIDATE_API_NAMES[i];
-    let receivedAnyEvent = false;
-
     try {
-      const submission = client.submit(apiName, args);
-
-      for await (const event of submission) {
-        receivedAnyEvent = true;
-
-        if (event.type === "status") {
-          if (event.stage === "error") {
-            throw new Error(event.message || "The model host reported an error.");
-          }
-          const reported = extractReportedProgress(event);
-          const elapsedPct = Math.min(
-            90,
-            Math.round(((Date.now() - startedAt) / EXPECTED_DURATION_MS) * 90)
-          );
-          const progress = Math.max(15, reported ?? elapsedPct);
-          jobs.set(jobId, { status: "processing", progress, startedAt });
-        }
-
-        if (event.type === "data") {
-          const videoUrl = extractVideoUrl(event.data?.[0]);
-          if (videoUrl) {
-            jobs.set(jobId, { status: "complete", progress: 100, videoUrl, startedAt });
-            return;
-          }
-        }
-      }
-
-      // The stream ended without ever sending a video. This candidate
-      // DID connect successfully, so this is a real failure, not a
-      // routing problem — don't try the next name for it.
-      throw new Error(
-        "The Space finished but didn't return a video. It may have changed its output format."
-      );
+      const videoUrl = await runCandidateWithTimeout(client, apiName, args, jobId, startedAt);
+      log(jobId, "generation complete");
+      setJobSafe(jobId, { status: "complete", progress: 100, videoUrl, startedAt });
+      return;
     } catch (err) {
-      // Only treat this as "wrong endpoint name, try the next one" if
-      // we never received a single event — meaning nothing (including
-      // GPU time) actually ran yet. Anything after a real event started
-      // is a genuine generation failure and must propagate as-is.
+      if (err.isTimeout) {
+        // A stalled queue or dropped connection — never worth retrying
+        // a different endpoint name, and never silent. Fails now.
+        throw err;
+      }
       const canFallBack =
-        !receivedAnyEvent && isRoutingError(err) && i < CANDIDATE_API_NAMES.length - 1;
-
+        !err.receivedAnyEvent && isRoutingError(err) && i < CANDIDATE_API_NAMES.length - 1;
       if (canFallBack) {
         lastRoutingError = err;
         continue;
@@ -214,6 +200,100 @@ async function runJob(jobId, { imageBuffer, mimeType, prompt, aspectRatio }) {
   }
 
   throw lastRoutingError || new Error("Could not reach the video model.");
+}
+
+/**
+ * Runs one generation attempt against one candidate endpoint name, with
+ * a hard timeout. Always resolves or rejects within GENERATION_TIMEOUT_MS,
+ * regardless of what Hugging Face's server does.
+ */
+async function runCandidateWithTimeout(client, apiName, args, jobId, startedAt) {
+  log(jobId, `submitting to ${apiName}`);
+  const submission = client.submit(apiName, args);
+  log(jobId, "submission created");
+
+  let receivedAnyEvent = false;
+  let sawGenerating = false;
+  let timeoutHandle;
+
+  const timeoutPromise = new Promise((resolve) => {
+    timeoutHandle = setTimeout(() => resolve({ timedOut: true }), GENERATION_TIMEOUT_MS);
+  });
+
+  const runPromise = (async () => {
+    for await (const event of submission) {
+      receivedAnyEvent = true;
+
+      if (event.type === "status") {
+        log(
+          jobId,
+          `status event: stage=${event.stage} position=${event.position ?? "-"} eta=${event.eta ?? "-"}`
+        );
+
+        if (event.stage === "error") {
+          throw new Error(event.message || "The model host reported an error.");
+        }
+        if (event.stage === "generating" && !sawGenerating) {
+          sawGenerating = true;
+          log(jobId, "generation started");
+        }
+
+        const reported = extractReportedProgress(event);
+        const elapsedPct = Math.min(
+          90,
+          Math.round(((Date.now() - startedAt) / EXPECTED_DURATION_MS) * 90)
+        );
+        const progress = Math.max(15, reported ?? elapsedPct);
+        setJobSafe(jobId, { status: "processing", progress, startedAt });
+      }
+
+      if (event.type === "data") {
+        log(jobId, "data received");
+        const videoUrl = extractVideoUrl(event.data?.[0]);
+        if (videoUrl) return { videoUrl };
+      }
+    }
+    throw new Error(
+      "The Space finished but didn't return a video. It may have changed its output format."
+    );
+  })();
+
+  // Prevents an "unhandled promise rejection" if the timeout wins the
+  // race below and this promise later rejects on its own with nobody
+  // awaiting it directly.
+  runPromise.catch(() => {});
+
+  try {
+    const result = await Promise.race([runPromise, timeoutPromise]);
+
+    if (result.timedOut) {
+      log(jobId, "timeout — cancelling submission");
+      safeCancel(submission, jobId);
+      const err = new Error(
+        "The free AI model took too long to respond. The ZeroGPU queue may be busy. Please try again."
+      );
+      err.isTimeout = true;
+      err.receivedAnyEvent = receivedAnyEvent;
+      throw err;
+    }
+
+    return result.videoUrl;
+  } catch (err) {
+    if (!("receivedAnyEvent" in err)) err.receivedAnyEvent = receivedAnyEvent;
+    throw err;
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
+function safeCancel(submission, jobId) {
+  try {
+    if (submission && typeof submission.cancel === "function") {
+      submission.cancel();
+    }
+  } catch (err) {
+    log(jobId, `cancel() failed (non-fatal): ${err.message}`);
+  }
 }
 
 function isRoutingError(err) {
@@ -237,6 +317,8 @@ function extractVideoUrl(output) {
 }
 
 function friendlyErrorMessage(err) {
+  if (err && err.isTimeout) return err.message;
+
   const msg = (err && err.message) || "";
   if (/quota/i.test(msg)) {
     return "The free model has hit its shared GPU quota for now. Wait a bit and try again — quota resets over time.";
