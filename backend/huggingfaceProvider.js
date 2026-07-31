@@ -1,6 +1,6 @@
 import { Client } from "@gradio/client";
 import sharp from "sharp";
-import { config } from "./config.js";
+import { config } from "../config.js";
 
 /**
  * Free-tier provider — calls the public Hugging Face Space
@@ -53,7 +53,8 @@ const jobs = new Map();
 
 // How long a generation typically takes on this Space, used only to
 // pace the progress bar when it doesn't report exact percentages.
-const EXPECTED_DURATION_MS = 60_000;
+// (Updated for the 8-step / 5s settings below — worst case ~95s.)
+const EXPECTED_DURATION_MS = 95_000;
 
 // This Space's own native target resolutions (see resize_image() in
 // its app.py: MAX_DIM=832, MIN_DIM=480, SQUARE_DIM=640, multiples of
@@ -65,13 +66,23 @@ const TARGET_DIMENSIONS = {
   "1:1": { width: 640, height: 640 },
 };
 
-// Generation settings. Steps 6 and duration 3s match this Space's own
-// UI defaults closely while keeping generation time reasonable on a
-// shared free GPU. guidance_scale 1 is correct for the Lightning LoRA
-// distilled steps this Space uses (higher values are for non-distilled
-// models and would just slow things down here).
-const STEPS = 6;
-const DURATION_SECONDS = 3;
+// Generation settings — verified against this Space's own app.py.
+//
+// STEPS = 8: the Space's own description says the Lightning LoRA is
+// tuned for a "4-8 steps" fast range; 8 is the top of that documented
+// range and visibly sharper than 6, without leaving the range the
+// model was actually distilled for. Going higher (the slider allows
+// up to 30) isn't documented as beneficial for this distilled LoRA,
+// so we don't guess past what the authors describe.
+//
+// DURATION_SECONDS = 5: this Space's own MAX_DURATION is exactly 5.0
+// (80 frames / 16fps) — the model's real maximum, not an estimate.
+//
+// GUIDANCE_SCALE / GUIDANCE_SCALE_2 stay at 1 (the Space's own
+// default): this LoRA is distilled for guidance≈1, and raising it is
+// not a documented or recommended use of this Space, so we leave it.
+const STEPS = 8;
+const DURATION_SECONDS = 5;
 const GUIDANCE_SCALE = 1;
 const GUIDANCE_SCALE_2 = 1;
 
@@ -121,15 +132,17 @@ async function runJob(jobId, { imageBuffer, mimeType, prompt, aspectRatio }) {
 
   // 1. Crop the source photo to this Space's own native target size
   //    for the chosen aspect ratio (see TARGET_DIMENSIONS comment above).
+  //    PNG (lossless) instead of re-compressed JPEG: one less layer of
+  //    compression softness feeding into the model.
   const dims = TARGET_DIMENSIONS[aspectRatio] || TARGET_DIMENSIONS["9:16"];
   const preparedImage = await sharp(imageBuffer)
     .rotate() // respect EXIF orientation from phone cameras
     .resize(dims.width, dims.height, { fit: "cover", position: "centre" })
-    .jpeg({ quality: 92 })
+    .png({ compressionLevel: 6 })
     .toBuffer();
 
   const client = await getClient();
-  const imageBlob = new Blob([preparedImage], { type: "image/jpeg" });
+  const imageBlob = new Blob([preparedImage], { type: "image/png" });
 
   const args = [
     imageBlob, // input_image
