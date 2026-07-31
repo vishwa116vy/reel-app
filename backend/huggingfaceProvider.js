@@ -3,8 +3,8 @@ import sharp from "sharp";
 import { config } from "./config.js";
 
 const CANDIDATE_API_NAMES = ["/generate_video", "/generate_video_1"];
-const GENERATION_TIMEOUT_MS = 5 * 60 * 1000;
-const EXPECTED_DURATION_MS = 120_000;
+const GENERATION_TIMEOUT_MS = 15 * 60 * 1000;
+const EXPECTED_DURATION_MS = 8 * 60 * 1000;
 
 const jobs = new Map();
 
