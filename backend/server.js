@@ -7,8 +7,8 @@ import { huggingfaceProvider } from "./huggingfaceProvider.js";
 
 /**
  * Provider registry. To add a commercial provider later:
- *   1. Create providers/runwayProvider.js (or similar) implementing
- *      generate()/checkStatus() — see providers/provider.interface.js
+ *   1. Create <name>Provider.js (or similar) implementing
+ *      generate()/checkStatus() — see provider.interface.js
  *   2. Import it here and add it to this map.
  *   3. Set VIDEO_PROVIDER in .env to select it.
  * server.js and the entire frontend stay unchanged.
