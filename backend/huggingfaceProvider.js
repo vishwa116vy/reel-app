@@ -1,28 +1,43 @@
 import { Client } from "@gradio/client";
 import sharp from "sharp";
-import { config } from "./config.js";
+import { config } from "../config.js";
 
 /**
  * Free-tier provider — calls the public Hugging Face Space
- * "multimodalart/stable-video-diffusion" (Stable Video Diffusion XT,
- * running on free ZeroGPU hardware). No paid API, no card.
+ * "zerogpu-aoti/wan2-2-fp8da-aoti-faster": Wan 2.2 14B Image-to-Video
+ * with Lightning LoRA distillation, FP8 quantization + AOT compile,
+ * running on free ZeroGPU (H200) hardware. No paid API, no card.
  *
  * Verified against the Space's actual source (app.py) on 2026-07-30:
- *   - api endpoint name: "/video"
- *   - inputs (in order): image, seed, randomize_seed, motion_bucket_id, fps_id
- *   - outputs: video, seed
+ *   - underlying fn: generate_video(input_image, prompt, steps,
+ *       negative_prompt, duration_seconds, guidance_scale,
+ *       guidance_scale_2, seed, randomize_seed) -> (video_path, seed)
+ *   - bound as: generate_button.click(fn=generate_video, inputs=[
+ *       input_image, prompt, steps, negative_prompt, duration_seconds,
+ *       guidance_scale, guidance_scale_2, seed, randomize_seed])
+ *   - REAL text-prompt conditioning (unlike the old SVD provider —
+ *     no more motion-keyword guessing; the prompt goes to the model).
+ *   - Resolution handling is dynamic: square input -> 640x640; other
+ *     aspect ratios are clamped/cropped between 480-832px per side, in
+ *     multiples of 16. We pre-crop to the Space's own native target
+ *     sizes below so ITS internal cropping is a no-op and nothing gets
+ *     stretched or unexpectedly re-framed.
+ *   - Fixed 16fps, 8-80 frames (0.5s-5.0s duration).
  *
- * Known limitations of this free model (be upfront with users about these):
- *   - SVD is IMAGE-ONLY — it has no text-prompt input. There is no free
- *     model we could find that does true text-guided image-to-video
- *     without a paid API. To still make the prompt useful, this provider
- *     scans it for motion keywords ("slow"/"gentle" vs "fast"/"dramatic")
- *     and maps that to the model's motion_bucket_id parameter. It's a
- *     real, working approximation, not full prompt-conditioning.
- *   - Public Space, shared GPU queue: expect 30s-3min depending on load,
- *     and occasional "queue full" or "GPU quota exceeded" errors — this
- *     provider surfaces those as a clear, retryable error message.
- *   - Output is a fixed ~4 second clip (25 frames at 6fps).
+ * One thing we could NOT verify by executing code (no outbound network
+ * access from where this was written): the exact auto-assigned Gradio
+ * api_name, since the Space's app.py doesn't set one explicitly. Gradio
+ * defaults to "/<function_name>" ("/generate_video" here), but this
+ * function is wired to TWO events (the Generate button, and a cached
+ * Examples gallery) — Gradio may suffix the second one. CANDIDATE_API_NAMES
+ * below tries "/generate_video" first; if that call ends WITHOUT ever
+ * receiving a single event from the Space (meaning the name itself was
+ * rejected before any GPU time was spent), it retries once with
+ * "/generate_video_1". Once real events start arriving, no more fallback
+ * attempts happen — a genuine generation failure is never mistaken for a
+ * routing problem or retried at GPU cost. If both candidates ever stop
+ * working (the Space's code changed), the error message will say so
+ * clearly, and this is the one line to check first.
  *
  * Swapping to a commercial provider later: create
  * providers/<name>Provider.js with the same generate()/checkStatus()
@@ -30,22 +45,40 @@ import { config } from "./config.js";
  * server.js and the entire frontend stay unchanged.
  */
 
+const CANDIDATE_API_NAMES = ["/generate_video", "/generate_video_1"];
+
 // In-memory job store. Fine for a single prototype server; replace with
 // Redis/a database before running more than one server instance.
 const jobs = new Map();
 
 // How long a generation typically takes on this Space, used only to
-// pace the progress bar when the Space doesn't report exact percentages.
-const EXPECTED_DURATION_MS = 75_000;
+// pace the progress bar when it doesn't report exact percentages.
+const EXPECTED_DURATION_MS = 60_000;
 
-// The Space was trained/tuned at 1024x576. We crop the uploaded photo to
-// match the requested aspect ratio before sending it, so the output
-// video actually comes back in the shape the user picked.
+// This Space's own native target resolutions (see resize_image() in
+// its app.py: MAX_DIM=832, MIN_DIM=480, SQUARE_DIM=640, multiples of
+// 16). Pre-cropping to these exact sizes means the Space's internal
+// resize is a no-op — no extra cropping/reframing happens server-side.
 const TARGET_DIMENSIONS = {
-  "16:9": { width: 1024, height: 576 },
-  "9:16": { width: 576, height: 1024 },
-  "1:1": { width: 768, height: 768 },
+  "16:9": { width: 832, height: 480 },
+  "9:16": { width: 480, height: 832 },
+  "1:1": { width: 640, height: 640 },
 };
+
+// Generation settings. Steps 6 and duration 3s match this Space's own
+// UI defaults closely while keeping generation time reasonable on a
+// shared free GPU. guidance_scale 1 is correct for the Lightning LoRA
+// distilled steps this Space uses (higher values are for non-distilled
+// models and would just slow things down here).
+const STEPS = 6;
+const DURATION_SECONDS = 3;
+const GUIDANCE_SCALE = 1;
+const GUIDANCE_SCALE_2 = 1;
+
+// Copied verbatim from the Space's own app.py — this is the negative
+// prompt the model's authors tuned it against, not creative text.
+const NEGATIVE_PROMPT =
+  "色调艳丽, 过曝, 静态, 细节模糊不清, 字幕, 风格, 作品, 画作, 画面, 静止, 整体发灰, 最差质量, 低质量, JPEG压缩残留, 丑陋的, 残缺的, 多余的手指, 画得不好的手部, 画得不好的脸部, 畸形的, 毁容的, 形态畸形的肢体, 手指融合, 静止不动的画面, 杂乱的背景, 三条腿, 背景人很多, 倒着走";
 
 let clientPromise = null;
 async function getClient() {
@@ -77,7 +110,6 @@ export const huggingfaceProvider = {
   async checkStatus(jobId) {
     const job = jobs.get(jobId);
     if (!job) return { status: "failed", message: "Unknown job." };
-    // Don't leak internal bookkeeping fields to the frontend.
     const { status, progress, videoUrl, message } = job;
     return { status, progress, videoUrl, message };
   },
@@ -87,7 +119,8 @@ async function runJob(jobId, { imageBuffer, mimeType, prompt, aspectRatio }) {
   const startedAt = jobs.get(jobId).startedAt;
   jobs.set(jobId, { status: "queued", progress: 8, startedAt });
 
-  // 1. Crop the source photo to match the chosen aspect ratio.
+  // 1. Crop the source photo to this Space's own native target size
+  //    for the chosen aspect ratio (see TARGET_DIMENSIONS comment above).
   const dims = TARGET_DIMENSIONS[aspectRatio] || TARGET_DIMENSIONS["9:16"];
   const preparedImage = await sharp(imageBuffer)
     .rotate() // respect EXIF orientation from phone cameras
@@ -95,67 +128,84 @@ async function runJob(jobId, { imageBuffer, mimeType, prompt, aspectRatio }) {
     .jpeg({ quality: 92 })
     .toBuffer();
 
-  // 2. Turn the free-text prompt into the model's motion parameter.
-  const motionBucketId = motionBucketFromPrompt(prompt);
-
-  // 3. Connect to the Space and submit the job.
   const client = await getClient();
   const imageBlob = new Blob([preparedImage], { type: "image/jpeg" });
 
-  const submission = client.submit("/video", [
-    imageBlob, // image
-    Math.floor(Math.random() * 1_000_000), // seed (arbitrary; randomize_seed below overrides it anyway)
+  const args = [
+    imageBlob, // input_image
+    prompt, // prompt — sent to the model directly, real conditioning
+    STEPS, // steps
+    NEGATIVE_PROMPT, // negative_prompt
+    DURATION_SECONDS, // duration_seconds
+    GUIDANCE_SCALE, // guidance_scale
+    GUIDANCE_SCALE_2, // guidance_scale_2
+    Math.floor(Math.random() * 2_147_483_647), // seed (overridden by randomize_seed below anyway)
     true, // randomize_seed
-    motionBucketId, // motion_bucket_id (1-255)
-    6, // fps_id
-  ]);
+  ];
 
   jobs.set(jobId, { status: "processing", progress: 15, startedAt });
 
-  for await (const event of submission) {
-    if (event.type === "status") {
-      if (event.stage === "error") {
-        throw new Error(event.message || "The model host reported an error.");
+  let lastRoutingError;
+  for (let i = 0; i < CANDIDATE_API_NAMES.length; i++) {
+    const apiName = CANDIDATE_API_NAMES[i];
+    let receivedAnyEvent = false;
+
+    try {
+      const submission = client.submit(apiName, args);
+
+      for await (const event of submission) {
+        receivedAnyEvent = true;
+
+        if (event.type === "status") {
+          if (event.stage === "error") {
+            throw new Error(event.message || "The model host reported an error.");
+          }
+          const reported = extractReportedProgress(event);
+          const elapsedPct = Math.min(
+            90,
+            Math.round(((Date.now() - startedAt) / EXPECTED_DURATION_MS) * 90)
+          );
+          const progress = Math.max(15, reported ?? elapsedPct);
+          jobs.set(jobId, { status: "processing", progress, startedAt });
+        }
+
+        if (event.type === "data") {
+          const videoUrl = extractVideoUrl(event.data?.[0]);
+          if (videoUrl) {
+            jobs.set(jobId, { status: "complete", progress: 100, videoUrl, startedAt });
+            return;
+          }
+        }
       }
 
-      // Different @gradio/client versions expose progress differently —
-      // use a real number if one is available, otherwise pace the bar
-      // by elapsed time so the UI still feels alive.
-      const reported = extractReportedProgress(event);
-      const elapsedPct = Math.min(
-        90,
-        Math.round(((Date.now() - startedAt) / EXPECTED_DURATION_MS) * 90)
+      // The stream ended without ever sending a video. This candidate
+      // DID connect successfully, so this is a real failure, not a
+      // routing problem — don't try the next name for it.
+      throw new Error(
+        "The Space finished but didn't return a video. It may have changed its output format."
       );
-      const progress = Math.max(15, reported ?? elapsedPct);
+    } catch (err) {
+      // Only treat this as "wrong endpoint name, try the next one" if
+      // we never received a single event — meaning nothing (including
+      // GPU time) actually ran yet. Anything after a real event started
+      // is a genuine generation failure and must propagate as-is.
+      const canFallBack =
+        !receivedAnyEvent && isRoutingError(err) && i < CANDIDATE_API_NAMES.length - 1;
 
-      jobs.set(jobId, {
-        status: "processing",
-        progress,
-        startedAt,
-      });
-    }
-
-    if (event.type === "data") {
-      const videoUrl = extractVideoUrl(event.data?.[0]);
-      if (videoUrl) {
-        jobs.set(jobId, { status: "complete", progress: 100, videoUrl, startedAt });
-        return;
+      if (canFallBack) {
+        lastRoutingError = err;
+        continue;
       }
+      throw err;
     }
   }
 
-  throw new Error(
-    "The Space finished but didn't return a video. It may have changed its output format."
-  );
+  throw lastRoutingError || new Error("Could not reach the video model.");
 }
 
-function motionBucketFromPrompt(prompt = "") {
-  const text = prompt.toLowerCase();
-  const gentle = /(gentle|subtle|slow|calm|slight|still|soft|barely)/.test(text);
-  const strong = /(fast|dramatic|energetic|wild|intense|rapid|explosive|violent|shake)/.test(text);
-  if (gentle && !strong) return 60;
-  if (strong && !gentle) return 200;
-  return 127; // balanced default
+function isRoutingError(err) {
+  const msg = (err && err.message) || "";
+  return /not found|no endpoint|unknown|invalid api|does not exist/i.test(msg);
 }
 
 function extractReportedProgress(event) {
@@ -176,13 +226,16 @@ function extractVideoUrl(output) {
 function friendlyErrorMessage(err) {
   const msg = (err && err.message) || "";
   if (/quota/i.test(msg)) {
-    return "The free model has hit its usage quota for now. Wait a few minutes and try again, or add a free Hugging Face account token (see README) for a higher quota.";
+    return "The free model has hit its shared GPU quota for now. Wait a bit and try again — quota resets over time.";
   }
   if (/queue/i.test(msg)) {
     return "The free model's queue is full right now. Please wait a minute and try again.";
   }
   if (/timeout|timed out/i.test(msg)) {
     return "The free model took too long to respond. Please try again — it can be slow at busy times.";
+  }
+  if (/not found|no endpoint|unknown|invalid api|does not exist/i.test(msg)) {
+    return "The free model's API has changed shape. This needs a quick code update — see the provider file's comments.";
   }
   return msg || "Generation failed. Please try again.";
 }
